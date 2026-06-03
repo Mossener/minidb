@@ -1,1 +1,0 @@
-/usr/sbin/c++  -Wall -Wextra -Wpedantic -g -O0 -Wl,--dependency-file=CMakeFiles/minidb.dir/link.d CMakeFiles/minidb.dir/src/main.cpp.o -o minidb  libminidb_lib.a

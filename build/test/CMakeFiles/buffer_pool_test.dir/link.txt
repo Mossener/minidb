@@ -1,1 +1,0 @@
-/usr/sbin/c++  -Wall -Wextra -Wpedantic -g -O0 -Wl,--dependency-file=CMakeFiles/buffer_pool_test.dir/link.d CMakeFiles/buffer_pool_test.dir/buffer_pool_test.cpp.o -o buffer_pool_test  ../libminidb_lib.a

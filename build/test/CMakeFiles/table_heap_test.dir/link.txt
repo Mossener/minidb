@@ -1,1 +1,0 @@
-/usr/sbin/c++  -Wall -Wextra -Wpedantic -g -O0 -Wl,--dependency-file=CMakeFiles/table_heap_test.dir/link.d CMakeFiles/table_heap_test.dir/table_heap_test.cpp.o -o table_heap_test  ../libminidb_lib.a
