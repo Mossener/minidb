@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/yurika/minidb/build/cmake_install.cmake",
+		"/home/yurika/minidb/build/test/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
