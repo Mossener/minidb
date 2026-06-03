@@ -83,10 +83,9 @@ bool TableHeap::DeleteTuple(rid_t rid, Transaction *txn) {
     if (!page) return false;
 
     TupleMeta meta = ReadTupleMeta(page->GetData(), offset);
+    txn->AddWriteRecord(rid, meta.end_ts, false); // save old end_ts before overwriting
     meta.end_ts = TS_UNCOMMITTED; // marked for deletion, not yet committed
     WriteTupleMeta(page->GetData(), offset, meta);
-
-    txn->AddWriteRecord(rid, meta.end_ts, false);
     bpm_->UnpinPage(page_id, true);
     return true;
 }

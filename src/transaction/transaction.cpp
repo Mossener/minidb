@@ -49,15 +49,17 @@ bool TransactionManager::IsActive(txn_id_t txn_id) const {
 }
 
 bool TransactionManager::IsVisible(const TupleMeta &meta, ts_t read_ts, txn_id_t reader_txn_id) const {
-    // Own uncommitted writes are always visible
+    // Own uncommitted insert (not yet deleted by self) → visible
     if (meta.begin_ts == TS_UNCOMMITTED && meta.txn_id == reader_txn_id) {
-        return true;
+        return meta.end_ts == TS_MAX;
     }
-    // Committed: begin_ts must be <= read_ts
-    // and (end_ts must be unset or > read_ts)
+    // Other transaction's uncommitted insert → invisible
     if (meta.begin_ts == TS_UNCOMMITTED) return false;
+    // Version created after reader's snapshot → invisible
     if (meta.begin_ts > read_ts) return false;
+    // Version was deleted before/at reader's snapshot → invisible
     if (meta.end_ts != TS_MAX && meta.end_ts <= read_ts) return false;
+    // Creating transaction still active (uncommitted at runtime) → invisible
     if (IsActive(meta.txn_id)) return false;
     return true;
 }
