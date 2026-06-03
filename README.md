@@ -146,22 +146,31 @@ rm -rf build/
 
 ```
 src/
-├── common/          # 数据库编排（BeginTxn / CommitTxn / AbortTxn）
-├── execution/       # 执行器（SeqScan, Insert, Delete）
-├── include/         # 头文件
-│   ├── common/      # Database, Config
-│   ├── execution/   # Executor
-│   ├── index/       # BPlusTree
-│   ├── parser/      # SQL Lexer + Parser + AST
-│   ├── storage/     # Page, Schema, Tuple, TupleMeta, TableHeap, DiskManager
-│   └── transaction/ # Transaction, TransactionManager
-├── index/           # B+Tree 索引实现
-├── parser/          # SQL 词法分析 + 递归下降解析器
-├── storage/         # 磁盘管理、缓冲池、LRU、堆表、Tuple 序列化
-├── transaction/     # 事务生命周期、IsVisible 可见性判断
-├── main.cpp         # REPL 交互界面
-└── linenoise.c      # 第三方行编辑库（上下键历史回查）
-test/                # 单元测试
+├── main.cpp                     # REPL 交互界面
+├── linenoise.c                  # 行编辑库（上下键历史）
+│
+├── common/
+│   └── database.cpp             # MiniDB 主类：建表、增删查、事务编排
+├── execution/
+│   └── executor.cpp             # 执行器：SeqScan / Insert / Delete / IndexScan
+├── index/
+│   └── b_plus_tree.cpp          # B+Tree 索引
+├── parser/
+│   └── parser.cpp               # SQL 词法分析 + 递归下降解析
+├── storage/
+│   ├── buffer_pool_manager.cpp  # 缓冲池（LRU 淘汰 + 脏页回写）
+│   ├── disk_manager.cpp         # 磁盘页读写
+│   ├── lru_replacer.cpp         # LRU 替换策略
+│   ├── schema.cpp               # 表结构定义
+│   ├── table_heap.cpp           # 堆表：Insert / Delete / Get / Scan
+│   └── tuple.cpp                # Tuple 序列化
+└── transaction/
+    └── transaction.cpp          # 事务生命周期 + IsVisible 可见性
+
+test/
+├── table_heap_test.cpp          # MVCC 隔离性测试
+├── buffer_pool_test.cpp         # 缓冲池测试
+└── b_plus_tree_test.cpp         # B+Tree 测试
 ```
 
 ## License
