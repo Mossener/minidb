@@ -1,12 +1,16 @@
+// 数据库主模块实现 - MiniDB 的建表、增删查、SQL执行和事务提交/回滚逻辑
+
 #include "common/database.h"
 #include <cstring>
 #include <algorithm>
 
 namespace minidb {
 
+// 构造函数: 初始化磁盘管理器 (文件名为 "minidb_data.minidb") 和缓冲池
 MiniDB::MiniDB()
     : disk_manager_("minidb_data"), bpm_(&disk_manager_) {}
 
+// 析构函数: 释放所有已注册的表及其组件
 MiniDB::~MiniDB() {
     for (auto &[name, info] : tables_) {
         delete info;
@@ -115,8 +119,9 @@ std::vector<Tuple> MiniDB::Scan(const std::string &table_name, Transaction *txn)
     return result;
 }
 
-// ── SQL-level ops ─────────────────────────────────
+// ── SQL 层操作 (AST -> 底层存储) ──────────────────
 
+// 将解析器的列类型枚举 (ColType) 转换为存储层的类型枚举 (TypeId)
 static TypeId to_type_id(ColType ct) {
     switch (ct) {
         case ColType::INTEGER: return TypeId::INTEGER;
@@ -294,16 +299,23 @@ TableInfo *MiniDB::GetTable(const std::string &name) {
     return nullptr;
 }
 
+// BeginTxn: 向事务管理器请求创建新事务
 Transaction *MiniDB::BeginTxn() {
     return txn_mgr_.Begin();
 }
 
+// CommitTxn: 提交事务，将写集合中所有操作的时间戳写入磁盘
+// 流程: 1) 校验事务状态为 RUNNING
+//       2) 调用 txn_mgr_.Commit 分配 commit_ts
+//       3) 遍历写集合: 对每个修改的元组，将 begin_ts(插入) 或 end_ts(删除) 设为 commit_ts
+// 写入 commit_ts 后，其他事务根据快照隔离规则即可看到该版本
 bool MiniDB::CommitTxn(Transaction *txn) {
     if (txn->GetState() != TransactionState::RUNNING) return false;
 
     txn_mgr_.Commit(txn);
     ts_t commit_ts = txn->GetCommitTs();
 
+    // 遍历事务的所有修改记录，将时间戳写入元组元数据
     for (const auto &wr : txn->GetWriteSet()) {
         page_id_t page_id = static_cast<page_id_t>(wr.rid >> 32);
         int offset = static_cast<int>(wr.rid & 0xFFFFFFFF);
@@ -312,8 +324,10 @@ bool MiniDB::CommitTxn(Transaction *txn) {
 
         TupleMeta meta = ReadTupleMeta(page->GetData(), offset);
         if (wr.is_insert) {
+            // 插入操作: begin_ts 从 TS_UNCOMMITTED 变为 commit_ts，正式生效
             meta.begin_ts = commit_ts;
         } else {
+            // 删除操作: end_ts 从 TS_UNCOMMITTED 变为 commit_ts，正式删除
             meta.end_ts = commit_ts;
         }
         WriteTupleMeta(page->GetData(), offset, meta);
@@ -322,6 +336,12 @@ bool MiniDB::CommitTxn(Transaction *txn) {
     return true;
 }
 
+// AbortTxn: 中止事务，回滚写集合中的所有修改
+// 流程: 1) 校验事务状态为 RUNNING
+//       2) 调用 txn_mgr_.Abort 标记事务为 ABORTED
+//       3) 遍历写集合，根据操作类型执行回滚:
+//          - 插入: 清零存储空间，回收页面空闲空间，减少元组计数
+//          - 删除: 恢复旧 end_ts (撤销软删除标记)
 bool MiniDB::AbortTxn(Transaction *txn) {
     if (txn->GetState() != TransactionState::RUNNING) return false;
     txn_mgr_.Abort(txn);
@@ -333,14 +353,16 @@ bool MiniDB::AbortTxn(Transaction *txn) {
         if (!page) continue;
 
         if (wr.is_insert) {
+            // 插入回滚: 清零整个元组存储区域，回收空间
             int storage_size = GetTupleStorageSize(page->GetData(), offset);
             memset(page->GetData() + offset, 0, storage_size);
             PageHeader header;
             memcpy(&header, page->GetData(), PAGE_HEADER_SIZE);
-            header.num_tuples--;
-            header.free_space += storage_size;
+            header.num_tuples--;               // 元组计数减一
+            header.free_space += storage_size; // 归还空闲空间
             memcpy(page->GetData(), &header, PAGE_HEADER_SIZE);
         } else {
+            // 删除回滚: 恢复原始的 end_ts (通常是 TS_MAX)
             TupleMeta meta = ReadTupleMeta(page->GetData(), offset);
             meta.end_ts = wr.old_end_ts;
             WriteTupleMeta(page->GetData(), offset, meta);

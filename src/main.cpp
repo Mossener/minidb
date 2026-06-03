@@ -1,9 +1,12 @@
+// MiniDB 主入口 - 基于 REPL 的命令行交互式 SQL 客户端
+// 支持用户输入 SQL 语句并实时执行，查看结果
+
 #include <iostream>
 #include <sstream>
 #include <vector>
 #include <string>
 #include <cstring>
-#include "linenoise.h"
+#include "linenoise.h"           // 命令行编辑和历史记录库
 #include "common/database.h"
 #include "storage/tuple.h"
 #include "storage/schema.h"
@@ -12,8 +15,11 @@
 
 using namespace minidb;
 
+// 全局事务指针: 模拟交互式会话中活跃的事务
+// auto-begin 模式: 首次 DML 操作时自动开启事务
 Transaction *g_txn = nullptr;
 
+// 打印帮助信息: 列出所有支持的命令和示例
 void PrintHelp() {
     std::cout << "MiniDB SQL Commands:\n"
               << "  CREATE TABLE name (col TYPE, ...)    Create table\n"
@@ -29,6 +35,8 @@ void PrintHelp() {
               << "Example: CREATE TABLE t (id INT, name VARCHAR(32), salary FLOAT)\n";
 }
 
+// PrintTuple: 将查询结果元组按列格式化输出到控制台
+// 格式: | col1=val1 | col2='val2' | ...
 void PrintTuple(const Tuple &t, const Schema &schema) {
     if (t.IsNull()) return;
     const char *data = t.GetData();
@@ -70,6 +78,8 @@ void PrintTuple(const Tuple &t, const Schema &schema) {
     std::cout << "\n";
 }
 
+// GetTxn: 获取当前活跃事务，若不存在则自动开启一个新事务
+// 实现 auto-begin 语义: INSERT/SELECT/DELETE 操作自动开启事务
 Transaction *GetTxn(MiniDB &db) {
     if (!g_txn) {
         g_txn = db.BeginTxn();
@@ -78,10 +88,11 @@ Transaction *GetTxn(MiniDB &db) {
     return g_txn;
 }
 
+// 主函数: 初始化 MiniDB 实例，进入 REPL 循环
 int main() {
     MiniDB db;
 
-    linenoiseHistorySetMaxLen(100);
+    linenoiseHistorySetMaxLen(100);  // 设置历史记录最大条数
 
     std::cout << "MiniDB v2.0 - MVCC Relational Database (SQL mode)\n";
     std::cout << "Type HELP for commands.\n\n";
@@ -89,12 +100,12 @@ int main() {
     char *line;
     while ((line = linenoise("minidb> ")) != nullptr) {
         if (line[0] == '\0') { linenoiseFree(line); continue; }
-        linenoiseHistoryAdd(line);
+        linenoiseHistoryAdd(line);  // 记录到命令历史
 
         std::string sql(line);
         linenoiseFree(line);
 
-        // Trim
+        // 去除首尾空白
         size_t start = sql.find_first_not_of(" \t\r\n");
         if (start == std::string::npos) continue;
         size_t end = sql.find_last_not_of(" \t\r\n;");
@@ -102,21 +113,21 @@ int main() {
         else sql.clear();
         if (sql.empty()) continue;
 
-        // Skip pure comment lines
+        // 跳过纯注释行
         if (sql.size() >= 2 && sql[0] == '-' && sql[1] == '-') continue;
 
         std::string upper;
         for (char c : sql) upper.push_back(static_cast<char>(std::toupper(c)));
 
-        // Handle non-SQL commands
+        // 处理非 SQL 的命令 (HELP / EXIT / QUIT)
         if (upper == "HELP") { PrintHelp(); continue; }
         if (upper == "EXIT" || upper == "QUIT") {
             if (g_txn && g_txn->GetState() == TransactionState::RUNNING)
-                db.AbortTxn(g_txn);
+                db.AbortTxn(g_txn);  // 退出前自动中止未提交的事务
             break;
         }
 
-        // Parse and execute SQL
+        // 解析并执行 SQL 语句
         try {
             SQLStatement stmt = ParseSQL(sql);
 
@@ -167,14 +178,14 @@ int main() {
                     if (!g_txn) { std::cout << "No active transaction.\n"; break; }
                     db.CommitTxn(g_txn);
                     std::cout << "Transaction " << g_txn->GetTxnId() << " committed.\n";
-                    g_txn = nullptr;
+                    g_txn = nullptr;  // 提交后清除事务引用
                     break;
                 }
                 case SQLType::ABORT_TXN: {
                     if (!g_txn) { std::cout << "No active transaction.\n"; break; }
                     db.AbortTxn(g_txn);
                     std::cout << "Transaction " << g_txn->GetTxnId() << " aborted.\n";
-                    g_txn = nullptr;
+                    g_txn = nullptr;  // 回滚后清除事务引用
                     break;
                 }
             }
@@ -183,6 +194,7 @@ int main() {
         }
     }
 
+    // 程序退出时，自动中止未提交的事务
     if (g_txn && g_txn->GetState() == TransactionState::RUNNING)
         db.AbortTxn(g_txn);
     std::cout << "Bye!\n";
