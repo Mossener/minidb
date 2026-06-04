@@ -164,6 +164,12 @@ int main() {
                     std::cout << "Deleted " << n << " row(s) from '" << stmt.table_name << "'.\n";
                     break;
                 }
+                case SQLType::UPDATE: {
+                    Transaction *txn = GetTxn(db);
+                    int n = db.ExecUpdate(stmt, txn);
+                    std::cout << "Updated " << n << " row(s) in '" << stmt.table_name << "'.\n";
+                    break;
+                }
                 case SQLType::BEGIN_TXN: {
                     if (g_txn) {
                         std::cout << "Transaction already active.\n";

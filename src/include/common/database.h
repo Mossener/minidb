@@ -56,6 +56,7 @@ public:
     bool ExecInsert(const SQLStatement &stmt, Transaction *txn);
     std::vector<Tuple> ExecSelect(const SQLStatement &stmt, Transaction *txn);
     int ExecDelete(const SQLStatement &stmt, Transaction *txn);
+    int ExecUpdate(const SQLStatement &stmt, Transaction *txn);
 
     // 查找指定名称的表信息
     TableInfo *GetTable(const std::string &name);

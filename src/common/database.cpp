@@ -354,6 +354,85 @@ int MiniDB::ExecDelete(const SQLStatement &stmt, Transaction *txn) {
     return deleted;
 }
 
+int MiniDB::ExecUpdate(const SQLStatement &stmt, Transaction *txn) {
+    auto *tbl = GetTable(stmt.table_name);
+    if (!tbl) return 0;
+
+    int updated = 0;
+    rid_t rid = tbl->heap->GetFirstRID(*tbl->schema);
+    while (rid >= 0) {
+        Tuple t = tbl->heap->GetTuple(*tbl->schema, rid, txn, &txn_mgr_);
+        rid_t next_rid = tbl->heap->GetNextRID(rid, *tbl->schema);
+        if (!t.IsNull() && (!stmt.where || EvalCondition(t, *tbl->schema, *stmt.where))) {
+            if (!lock_mgr_.LockX(rid, txn->GetTxnId())) { rid = next_rid; continue; }
+
+            // 保存旧数据用于回滚
+            page_id_t pid = static_cast<page_id_t>(rid >> 32);
+            int off = static_cast<int>(rid & 0xFFFFFFFF);
+            Page *page = bpm_.FetchPage(pid);
+            if (!page) { rid = next_rid; continue; }
+
+            int sz = GetTupleStorageSize(page->GetData(), off);
+            std::vector<char> old_data(page->GetData() + off,
+                                       page->GetData() + off + sz);
+
+            // 修改指定列的数据
+            for (const auto &asgn : stmt.assignments) {
+                for (size_t ci = 0; ci < tbl->schema->GetColumnCount(); ci++) {
+                    if (tbl->schema->GetColumn(ci).name == asgn.column) {
+                        size_t col_off = TUPLE_META_HEADER_SIZE
+                                       + static_cast<int>(tbl->schema->GetColumnOffset(ci));
+                        const auto &col = tbl->schema->GetColumn(ci);
+                        switch (col.type) {
+                            case TypeId::INTEGER: {
+                                int32_t v = static_cast<int32_t>(asgn.value.AsInt());
+                                memcpy(page->GetData() + off + col_off, &v, 4);
+                                break;
+                            }
+                            case TypeId::FLOAT: {
+                                double v = asgn.value.AsFloat();
+                                memcpy(page->GetData() + off + col_off, &v, 8);
+                                break;
+                            }
+                            case TypeId::VARCHAR: {
+                                std::string s = asgn.value.AsString();
+                                size_t cp = std::min(s.size(), col.length ? col.length : s.size());
+                                memset(page->GetData() + off + col_off, 0, col.length);
+                                memcpy(page->GetData() + off + col_off, s.data(), cp);
+                                break;
+                            }
+                            case TypeId::BOOLEAN: {
+                                std::string s = asgn.value.AsString();
+                                page->GetData()[off + col_off] =
+                                    (s == "true" || s == "1") ? 1 : 0;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // 记录 WriteRecord 用于回滚
+            txn->AddWriteRecord(rid, 0, false, true, old_data);
+
+            // WAL: 记录 UPDATE 日志 (存新数据用于恢复)
+            int buf_sz = sizeof(int64_t) + sizeof(int32_t) + sz;
+            std::vector<char> buf(buf_sz);
+            memcpy(buf.data(), &rid, 8);
+            memcpy(buf.data() + 8, &sz, 4);
+            memcpy(buf.data() + 12, page->GetData() + off, sz);
+            log_mgr_.Append(txn->GetTxnId(), LogRecordType::INSERT,
+                           buf.data(), static_cast<int32_t>(buf_sz));
+
+            bpm_.UnpinPage(pid, true);
+            updated++;
+        }
+        rid = next_rid;
+    }
+    return updated;
+}
+
 TableInfo *MiniDB::GetTable(const std::string &name) {
     auto it = tables_.find(name);
     if (it != tables_.end()) return it->second;
@@ -390,7 +469,9 @@ bool MiniDB::CommitTxn(Transaction *txn) {
         if (!page) continue;
 
         TupleMeta meta = ReadTupleMeta(page->GetData(), offset);
-        if (wr.is_insert) {
+        if (wr.is_update) {
+            // UPDATE: 数据已写入，meta 无需修改
+        } else if (wr.is_insert) {
             meta.begin_ts = commit_ts;
         } else {
             meta.end_ts = commit_ts;
@@ -424,11 +505,14 @@ bool MiniDB::AbortTxn(Transaction *txn) {
             memset(page->GetData() + offset, 0, storage_size);
             PageHeader header;
             memcpy(&header, page->GetData(), PAGE_HEADER_SIZE);
-            header.num_tuples--;               // 元组计数减一
-            header.free_space += storage_size; // 归还空闲空间
+            header.num_tuples--;
+            header.free_space += storage_size;
             memcpy(page->GetData(), &header, PAGE_HEADER_SIZE);
+        } else if (wr.is_update) {
+            // 更新回滚: 恢复旧数据
+            memcpy(page->GetData() + offset, wr.old_data.data(), wr.old_data.size());
         } else {
-            // 删除回滚: 恢复原始的 end_ts (通常是 TS_MAX)
+            // 删除回滚: 恢复原始的 end_ts
             TupleMeta meta = ReadTupleMeta(page->GetData(), offset);
             meta.end_ts = wr.old_end_ts;
             WriteTupleMeta(page->GetData(), offset, meta);

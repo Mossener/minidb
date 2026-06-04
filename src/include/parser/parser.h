@@ -15,13 +15,14 @@ namespace minidb {
 
 // SQL 语句类型枚举
 enum class SQLType {
-    CREATE_TABLE,   // CREATE TABLE 建表语句
-    INSERT,          // INSERT INTO 插入语句
-    SELECT,          // SELECT 查询语句
-    DELETE,          // DELETE FROM 删除语句
-    BEGIN_TXN,       // BEGIN 开始事务
-    COMMIT_TXN,      // COMMIT 提交事务
-    ABORT_TXN,       // ABORT 中止事务
+    CREATE_TABLE,
+    INSERT,
+    SELECT,
+    DELETE,
+    UPDATE,
+    BEGIN_TXN,
+    COMMIT_TXN,
+    ABORT_TXN,
 };
 
 // 列数据类型枚举 (解析器层面)
@@ -54,19 +55,23 @@ struct CompareCondition {
     LiteralValue value;  // 比较的右侧值
 };
 
+// UPDATE: WHERE 条件 + SET 赋值列表
+struct UpdateAssignment {
+    std::string column;   // 要更新的列名
+    LiteralValue value;   // 新值
+};
+
 // SQL 语句 AST: 一条完整 SQL 语句的解析结果
 struct SQLStatement {
-    SQLType type;            // 语句类型
-    std::string table_name;  // 涉及的表名
+    SQLType type;
+    std::string table_name;
 
-    // CREATE TABLE: 列定义列表
     std::vector<ColumnDef> columns;
-
-    // INSERT: 多行插入的值列表 (每行是一个字面值向量)
     std::vector<std::vector<LiteralValue>> insert_values;
-
-    // SELECT / DELETE: WHERE 条件 (可为空，表示无条件)
     std::unique_ptr<CompareCondition> where;
+
+    // UPDATE: SET 赋值列表
+    std::vector<UpdateAssignment> assignments;
 };
 
 // ── 解析器入口 ─────────────────────────────────────

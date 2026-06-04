@@ -40,7 +40,7 @@ ColType ColumnTypeFromString(const std::string &s) {
 
 // Token 类型枚举: 词法分析器输出的一级符号类型
 enum class Tok {
-    CREATE, TABLE, INSERT, INTO, VALUES, SELECT, FROM, DELETE,
+    CREATE, TABLE, INSERT, INTO, VALUES, SELECT, FROM, DELETE, UPDATE, SET,
     WHERE, AND, OR, BEGIN_TOK, COMMIT_TOK, ABORT_TOK, DROP, INDEX,
     IDENT, NUMBER, STRING, BOOL_LIT, STAR, LPAREN, RPAREN, COMMA, SEMI,
     EQ, NE, LT, GT, LE, GE, END, UNKNOWN
@@ -71,6 +71,8 @@ static Tok keyword_tok(const std::string &s) {
     if (low == "select") return Tok::SELECT;
     if (low == "from") return Tok::FROM;
     if (low == "delete") return Tok::DELETE;
+    if (low == "update") return Tok::UPDATE;
+    if (low == "set") return Tok::SET;
     if (low == "where") return Tok::WHERE;
     if (low == "and") return Tok::AND;
     if (low == "or") return Tok::OR;
@@ -188,6 +190,7 @@ public:
             case Tok::INSERT: return parse_insert();
             case Tok::SELECT: return parse_select();
             case Tok::DELETE: return parse_delete();
+            case Tok::UPDATE: return parse_update();
             case Tok::BEGIN_TOK: return parse_begin();
             case Tok::COMMIT_TOK: return parse_commit();
             case Tok::ABORT_TOK: return parse_abort();
@@ -317,6 +320,35 @@ private:
             stmt.where = parse_condition();
         } else {
             throw std::runtime_error("DELETE requires a WHERE clause");
+        }
+
+        if (cur.type == Tok::SEMI) advance();
+        return stmt;
+    }
+
+    // 解析 UPDATE table SET col=val,... WHERE cond
+    SQLStatement parse_update() {
+        advance(); // skip UPDATE
+        SQLStatement stmt;
+        stmt.type = SQLType::UPDATE;
+        stmt.table_name = cur.text;
+        expect(Tok::IDENT);
+        expect(Tok::SET);
+
+        // SET col = val, col2 = val2, ...
+        do {
+            UpdateAssignment asgn;
+            asgn.column = cur.text;
+            expect(Tok::IDENT);
+            expect(Tok::EQ);
+            asgn.value = parse_literal();
+            stmt.assignments.push_back(std::move(asgn));
+            if (cur.type == Tok::COMMA) advance();
+        } while (cur.type == Tok::IDENT);
+
+        if (cur.type == Tok::WHERE) {
+            advance();
+            stmt.where = parse_condition();
         }
 
         if (cur.type == Tok::SEMI) advance();

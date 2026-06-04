@@ -16,12 +16,15 @@ namespace minidb {
 // 事务状态: 运行中 / 已提交 / 已中止
 enum class TransactionState { RUNNING, COMMITTED, ABORTED };
 
-// 写记录: 记录事务修改过的每个元组的 RID、旧 end_ts 以及是否为插入操作
-// 用于 Commit 时批量写入 begin_ts/end_ts，以及 Abort 时回滚修改
+// 写记录: 记录事务修改过的每个元组的 RID、旧 end_ts、操作类型
+// Commit: 根据类型写入 begin_ts / end_ts
+// Abort:  根据类型回滚 (插入清空 / 删除恢复 / 更新还原旧数据)
 struct WriteRecord {
-    rid_t rid;           // 被修改元组的 RID
-    int64_t old_end_ts;  // 修改前的 end_ts (用于回滚时恢复)
-    bool is_insert;      // true 表示插入操作, false 表示删除操作
+    rid_t rid;
+    int64_t old_end_ts;
+    bool is_insert;
+    bool is_update = false;
+    std::vector<char> old_data;  // UPDATE 回滚用: 修改前的完整行数据
 };
 
 // 事务对象: 保存事务的快照信息、状态和写集合
@@ -39,8 +42,10 @@ public:
     void SetState(TransactionState state) { state_ = state; }
 
     // 向写集合中添加一条修改记录
-    void AddWriteRecord(rid_t rid, int64_t old_end_ts, bool is_insert) {
-        write_set_.push_back({rid, old_end_ts, is_insert});
+    void AddWriteRecord(rid_t rid, int64_t old_end_ts, bool is_insert,
+                         bool is_update = false,
+                         std::vector<char> old_data = {}) {
+        write_set_.push_back({rid, old_end_ts, is_insert, is_update, std::move(old_data)});
     }
     const std::vector<WriteRecord> &GetWriteSet() const { return write_set_; }
     void ClearWriteSet() { write_set_.clear(); }
