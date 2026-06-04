@@ -306,10 +306,60 @@ bool MiniDB::ExecInsert(const SQLStatement &stmt, Transaction *txn) {
     return true;
 }
 
+std::string MiniDB::ExplainSelect(const SQLStatement &stmt) {
+    auto *tbl = GetTable(stmt.table_name);
+    if (!tbl) return "Table not found";
+
+    bool use_index = false;
+    if (stmt.where && tbl->has_index) {
+        const auto &col = stmt.where->column;
+        // 检查 WHERE 列是否在索引的第一列（MiniDB 只支持 id 列索引）
+        use_index = (!col.empty() && col == "id" &&
+                     stmt.where->op == CompareCondition::EQ);
+    }
+
+    std::string plan = "Query Plan\n";
+    plan += "  Table: " + stmt.table_name + "\n";
+    if (use_index) {
+        plan += "  -> IndexScan (B+Tree on id)  [cost: O(log n + 1)]\n";
+    } else {
+        plan += "  -> SeqScan                  [cost: O(n)]\n";
+    }
+    if (stmt.where) {
+        const char *op_str = "=";
+        switch (stmt.where->op) {
+            case CompareCondition::EQ: op_str = "="; break;
+            case CompareCondition::NE: op_str = "<>"; break;
+            case CompareCondition::LT: op_str = "<"; break;
+            case CompareCondition::GT: op_str = ">"; break;
+            case CompareCondition::LE: op_str = "<="; break;
+            case CompareCondition::GE: op_str = ">="; break;
+        }
+        plan += "  -> Filter: " + stmt.where->column + " " + op_str +
+                " " + stmt.where->value.AsString() + "\n";
+    }
+    return plan;
+}
+
 std::vector<Tuple> MiniDB::ExecSelect(const SQLStatement &stmt, Transaction *txn) {
     std::vector<Tuple> result;
     auto *tbl = GetTable(stmt.table_name);
     if (!tbl) return result;
+
+    // 简单优化器: WHERE id = val 且有索引 → 走 IndexScan，否则 SeqScan
+    bool use_index = (stmt.where && tbl->has_index &&
+                      stmt.where->column == "id" &&
+                      stmt.where->op == CompareCondition::EQ);
+
+    if (use_index) {
+        int64_t key = stmt.where->value.AsInt();
+        rid_t rid;
+        if (tbl->index->GetValue(key, &rid)) {
+            Tuple t = tbl->heap->GetTuple(*tbl->schema, rid, txn, &txn_mgr_);
+            if (!t.IsNull()) result.push_back(t);
+        }
+        return result;
+    }
 
     rid_t rid = tbl->heap->GetFirstRID(*tbl->schema);
     while (rid >= 0) {

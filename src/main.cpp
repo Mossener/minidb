@@ -139,6 +139,13 @@ int main() {
                         std::cout << "ERROR: Table '" << stmt.table_name << "' already exists.\n";
                     break;
                 }
+                case SQLType::CREATE_INDEX: {
+                    if (db.CreateIndex(stmt.table_name))
+                        std::cout << "Index created on '" << stmt.table_name << "'.\n";
+                    else
+                        std::cout << "ERROR: Table '" << stmt.table_name << "' not found.\n";
+                    break;
+                }
                 case SQLType::INSERT: {
                     Transaction *txn = GetTxn(db);
                     if (db.ExecInsert(stmt, txn))
@@ -147,7 +154,11 @@ int main() {
                         std::cout << "ERROR: Insert failed.\n";
                     break;
                 }
-                case SQLType::SELECT: {
+                case SQLType::SELECT:
+                case SQLType::EXPLAIN_SELECT: {
+                    if (stmt.type == SQLType::EXPLAIN_SELECT) {
+                        std::cout << db.ExplainSelect(stmt);
+                    }
                     Transaction *txn = GetTxn(db);
                     auto results = db.ExecSelect(stmt, txn);
                     auto *tbl = db.GetTable(stmt.table_name);

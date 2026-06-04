@@ -41,7 +41,7 @@ ColType ColumnTypeFromString(const std::string &s) {
 // Token 类型枚举: 词法分析器输出的一级符号类型
 enum class Tok {
     CREATE, TABLE, INSERT, INTO, VALUES, SELECT, FROM, DELETE, UPDATE, SET,
-    WHERE, AND, OR, BEGIN_TOK, COMMIT_TOK, ABORT_TOK, DROP, INDEX,
+    EXPLAIN, WHERE, AND, OR, BEGIN_TOK, COMMIT_TOK, ABORT_TOK, DROP, INDEX,
     IDENT, NUMBER, STRING, BOOL_LIT, STAR, LPAREN, RPAREN, COMMA, SEMI,
     EQ, NE, LT, GT, LE, GE, END, UNKNOWN
 };
@@ -73,6 +73,7 @@ static Tok keyword_tok(const std::string &s) {
     if (low == "delete") return Tok::DELETE;
     if (low == "update") return Tok::UPDATE;
     if (low == "set") return Tok::SET;
+    if (low == "explain") return Tok::EXPLAIN;
     if (low == "where") return Tok::WHERE;
     if (low == "and") return Tok::AND;
     if (low == "or") return Tok::OR;
@@ -191,6 +192,7 @@ public:
             case Tok::SELECT: return parse_select();
             case Tok::DELETE: return parse_delete();
             case Tok::UPDATE: return parse_update();
+            case Tok::EXPLAIN: return parse_explain();
             case Tok::BEGIN_TOK: return parse_begin();
             case Tok::COMMIT_TOK: return parse_commit();
             case Tok::ABORT_TOK: return parse_abort();
@@ -213,9 +215,21 @@ private:
         advance();
     }
 
-    // 解析 CREATE TABLE name ( col TYPE, ... )
+    // 解析 CREATE TABLE / CREATE INDEX
     SQLStatement parse_create_table() {
-        advance(); // 跳过 CREATE
+        advance(); // skip CREATE
+
+        // CREATE INDEX name
+        if (cur.type == Tok::INDEX) {
+            advance(); // skip INDEX
+            SQLStatement stmt;
+            stmt.type = SQLType::CREATE_INDEX;
+            stmt.table_name = cur.text;
+            expect(Tok::IDENT);
+            if (cur.type == Tok::SEMI) advance();
+            return stmt;
+        }
+
         expect(Tok::TABLE);
         SQLStatement stmt;
         stmt.type = SQLType::CREATE_TABLE;
@@ -352,6 +366,14 @@ private:
         }
 
         if (cur.type == Tok::SEMI) advance();
+        return stmt;
+    }
+
+    // 解析 EXPLAIN SELECT ... — 复用 SELECT 解析，改类型为 EXPLAIN_SELECT
+    SQLStatement parse_explain() {
+        advance(); // skip EXPLAIN
+        SQLStatement stmt = parse_select();
+        stmt.type = SQLType::EXPLAIN_SELECT;
         return stmt;
     }
 

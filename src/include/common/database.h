@@ -60,6 +60,7 @@ public:
     std::vector<Tuple> ExecSelect(const SQLStatement &stmt, Transaction *txn);
     int ExecDelete(const SQLStatement &stmt, Transaction *txn);
     int ExecUpdate(const SQLStatement &stmt, Transaction *txn);
+    std::string ExplainSelect(const SQLStatement &stmt);  // EXPLAIN: 生成执行计划
 
     // 查找指定名称的表信息
     TableInfo *GetTable(const std::string &name);

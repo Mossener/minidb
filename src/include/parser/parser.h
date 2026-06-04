@@ -20,6 +20,8 @@ enum class SQLType {
     SELECT,
     DELETE,
     UPDATE,
+    EXPLAIN_SELECT,
+    CREATE_INDEX,
     BEGIN_TXN,
     COMMIT_TXN,
     ABORT_TXN,
