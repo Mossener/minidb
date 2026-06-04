@@ -3,12 +3,17 @@
 #include "common/database.h"
 #include <cstring>
 #include <algorithm>
+#include <unordered_map>
+#include <unistd.h>
 
 namespace minidb {
 
-// 构造函数: 初始化磁盘管理器 (文件名为 "minidb_data.minidb") 和缓冲池
+// 构造函数: 初始化磁盘管理器、缓冲池、日志管理器，然后执行崩溃恢复
 MiniDB::MiniDB()
-    : disk_manager_("minidb_data"), bpm_(&disk_manager_) {}
+    : disk_manager_("minidb_data"), bpm_(&disk_manager_),
+      log_mgr_("minidb_data.wal") {
+    DoRecover();
+}
 
 // 析构函数: 释放所有已注册的表及其组件
 MiniDB::~MiniDB() {
@@ -67,10 +72,27 @@ bool MiniDB::Insert(const std::string &table_name, const Tuple &tuple, Transacti
     if (it == tables_.end()) return false;
     rid_t rid;
     bool ok = it->second->heap->InsertTuple(tuple, &rid, txn);
-    if (ok && it->second->has_index) {
-        int32_t key32;
-        memcpy(&key32, tuple.GetData(), sizeof(int32_t));
-        it->second->index->Insert(static_cast<int64_t>(key32), rid);
+    if (ok) {
+        if (it->second->has_index) {
+            int32_t key32;
+            memcpy(&key32, tuple.GetData(), sizeof(int32_t));
+            it->second->index->Insert(static_cast<int64_t>(key32), rid);
+        }
+        // WAL: 记录 INSERT 日志（完整 tuple 页数据，用于崩溃恢复）
+        page_id_t pid = static_cast<page_id_t>(rid >> 32);
+        int off = static_cast<int>(rid & 0xFFFFFFFF);
+        Page *p = bpm_.FetchPage(pid);
+        if (p) {
+            int sz = GetTupleStorageSize(p->GetData(), off);
+            int buf_sz = sizeof(int64_t) + sizeof(int32_t) + sz;
+            std::vector<char> buf(buf_sz);
+            memcpy(buf.data(), &rid, 8);
+            memcpy(buf.data() + 8, &sz, 4);
+            memcpy(buf.data() + 12, p->GetData() + off, sz);
+            log_mgr_.Append(txn->GetTxnId(), LogRecordType::INSERT,
+                           buf.data(), static_cast<int32_t>(buf_sz));
+            bpm_.UnpinPage(pid, false);
+        }
     }
     return ok;
 }
@@ -80,8 +102,16 @@ bool MiniDB::Delete(const std::string &table_name, int64_t key, Transaction *txn
     if (it == tables_.end()) return false;
     rid_t rid;
     if (it->second->has_index && it->second->index->GetValue(key, &rid)) {
+        // 行级锁: 先锁后删
+        if (!lock_mgr_.LockX(rid, txn->GetTxnId())) return false;
         it->second->heap->DeleteTuple(rid, txn);
         it->second->index->Remove(key);
+        // WAL: 记录 DELETE 日志
+        const auto &wr = txn->GetWriteSet().back();
+        char buf[16];
+        memcpy(buf, &rid, 8);
+        memcpy(buf + 8, &wr.old_end_ts, 8);
+        log_mgr_.Append(txn->GetTxnId(), LogRecordType::DELETE, buf, 16);
         return true;
     }
     Schema *schema = it->second->schema;
@@ -92,7 +122,15 @@ bool MiniDB::Delete(const std::string &table_name, int64_t key, Transaction *txn
             int32_t k;
             memcpy(&k, t.GetData(), sizeof(int32_t));
             if (static_cast<int64_t>(k) == key) {
+                // 行级锁
+                if (!lock_mgr_.LockX(scan_rid, txn->GetTxnId())) return false;
                 it->second->heap->DeleteTuple(scan_rid, txn);
+                // WAL: 记录 DELETE 日志
+                const auto &wr = txn->GetWriteSet().back();
+                char buf[16];
+                memcpy(buf, &scan_rid, 8);
+                memcpy(buf + 8, &wr.old_end_ts, 8);
+                log_mgr_.Append(txn->GetTxnId(), LogRecordType::DELETE, buf, 16);
                 return true;
             }
         }
@@ -248,6 +286,21 @@ bool MiniDB::ExecInsert(const SQLStatement &stmt, Transaction *txn) {
             memcpy(&key32, tuple.GetData(), sizeof(int32_t));
             tbl->index->Insert(static_cast<int64_t>(key32), rid);
         }
+        // WAL: 记录 INSERT 日志
+        page_id_t pid = static_cast<page_id_t>(rid >> 32);
+        int off = static_cast<int>(rid & 0xFFFFFFFF);
+        Page *p = bpm_.FetchPage(pid);
+        if (p) {
+            int sz = GetTupleStorageSize(p->GetData(), off);
+            int buf_sz = sizeof(int64_t) + sizeof(int32_t) + sz;
+            std::vector<char> buf(buf_sz);
+            memcpy(buf.data(), &rid, 8);
+            memcpy(buf.data() + 8, &sz, 4);
+            memcpy(buf.data() + 12, p->GetData() + off, sz);
+            log_mgr_.Append(txn->GetTxnId(), LogRecordType::INSERT,
+                           buf.data(), static_cast<int32_t>(buf_sz));
+            bpm_.UnpinPage(pid, false);
+        }
     }
     return true;
 }
@@ -280,7 +333,15 @@ int MiniDB::ExecDelete(const SQLStatement &stmt, Transaction *txn) {
         Tuple t = tbl->heap->GetTuple(*tbl->schema, rid, txn, &txn_mgr_);
         rid_t next_rid = tbl->heap->GetNextRID(rid, *tbl->schema);
         if (!t.IsNull() && stmt.where && EvalCondition(t, *tbl->schema, *stmt.where)) {
+            // 行级锁
+            if (!lock_mgr_.LockX(rid, txn->GetTxnId())) continue;
             tbl->heap->DeleteTuple(rid, txn);
+            // WAL: 记录 DELETE 日志
+            const auto &wr = txn->GetWriteSet().back();
+            char buf[16];
+            memcpy(buf, &rid, 8);
+            memcpy(buf + 8, &wr.old_end_ts, 8);
+            log_mgr_.Append(txn->GetTxnId(), LogRecordType::DELETE, buf, 16);
             deleted++;
             if (tbl->has_index) {
                 int32_t key32;
@@ -304,18 +365,24 @@ Transaction *MiniDB::BeginTxn() {
     return txn_mgr_.Begin();
 }
 
-// CommitTxn: 提交事务，将写集合中所有操作的时间戳写入磁盘
-// 流程: 1) 校验事务状态为 RUNNING
-//       2) 调用 txn_mgr_.Commit 分配 commit_ts
-//       3) 遍历写集合: 对每个修改的元组，将 begin_ts(插入) 或 end_ts(删除) 设为 commit_ts
-// 写入 commit_ts 后，其他事务根据快照隔离规则即可看到该版本
+// CommitTxn: 提交事务 — WAL 协议核心
+// 步骤: ① 分配 commit_ts
+//      ② 写 COMMIT 日志 + fsync (WAL 关键: 日志必须先于数据页落盘)
+//      ③ 更新数据页上的 begin_ts / end_ts (崩溃恢复时从日志重放本步)
 bool MiniDB::CommitTxn(Transaction *txn) {
     if (txn->GetState() != TransactionState::RUNNING) return false;
 
+    // ① 分配提交时间戳
     txn_mgr_.Commit(txn);
     ts_t commit_ts = txn->GetCommitTs();
 
-    // 遍历事务的所有修改记录，将时间戳写入元组元数据
+    // ② WAL: 先 fsync 日志，确保 COMMIT 记录已持久化（含 commit_ts，供恢复使用）
+    int64_t cts = commit_ts;
+    log_mgr_.Append(txn->GetTxnId(), LogRecordType::COMMIT,
+                    reinterpret_cast<const char*>(&cts), sizeof(int64_t));
+    log_mgr_.Flush();
+
+    // ③ 日志已安全落盘，现在更新数据页上的元数据
     for (const auto &wr : txn->GetWriteSet()) {
         page_id_t page_id = static_cast<page_id_t>(wr.rid >> 32);
         int offset = static_cast<int>(wr.rid & 0xFFFFFFFF);
@@ -324,15 +391,14 @@ bool MiniDB::CommitTxn(Transaction *txn) {
 
         TupleMeta meta = ReadTupleMeta(page->GetData(), offset);
         if (wr.is_insert) {
-            // 插入操作: begin_ts 从 TS_UNCOMMITTED 变为 commit_ts，正式生效
             meta.begin_ts = commit_ts;
         } else {
-            // 删除操作: end_ts 从 TS_UNCOMMITTED 变为 commit_ts，正式删除
             meta.end_ts = commit_ts;
         }
         WriteTupleMeta(page->GetData(), offset, meta);
         bpm_.UnpinPage(page_id, true);
     }
+    lock_mgr_.UnlockAll(txn->GetTxnId());  // 提交时释放行级锁
     return true;
 }
 
@@ -369,7 +435,77 @@ bool MiniDB::AbortTxn(Transaction *txn) {
         }
         bpm_.UnpinPage(page_id, true);
     }
+    lock_mgr_.UnlockAll(txn->GetTxnId());  // 回滚时释放行级锁
     return true;
+}
+
+// DoRecover: 启动时从 WAL 恢复未持久化的已提交操作
+// 流程: ① 扫描 WAL → 找出所有 COMMIT 记录，建立 txn_id→commit_ts 映射
+//      ② 重放已提交事务的 INSERT（写回 page + 更新 begin_ts）和 DELETE（更新 end_ts）
+//      ③ 截断 WAL 文件
+void MiniDB::DoRecover() {
+    auto records = log_mgr_.Recover();
+    if (records.empty()) return;
+
+    // ① 从 COMMIT 记录中提取每个事务的 commit_ts
+    std::unordered_map<int64_t, int64_t> commit_ts_map;
+    for (const auto &rec : records) {
+        if (rec.type == LogRecordType::COMMIT && rec.data.size() >= 8) {
+            int64_t cts;
+            memcpy(&cts, rec.data.data(), 8);
+            commit_ts_map[rec.txn_id] = cts;
+        }
+    }
+
+    // ② 重放 INSERT / DELETE
+    for (const auto &rec : records) {
+        int64_t cts = commit_ts_map[rec.txn_id];
+
+        if (rec.type == LogRecordType::INSERT) {
+            rid_t rid;
+            int32_t sz;
+            memcpy(&rid, rec.data.data(), 8);
+            memcpy(&sz, rec.data.data() + 8, 4);
+
+            page_id_t pid = static_cast<page_id_t>(rid >> 32);
+            int off = static_cast<int>(rid & 0xFFFFFFFF);
+
+            Page *page = bpm_.FetchPage(pid);
+            if (!page) { page = bpm_.NewPage(&pid); }
+            if (page) {
+                // 写回元组数据（含未提交的 begin_ts）
+                memcpy(page->GetData() + off, rec.data.data() + 12, sz);
+                // 更新 begin_ts 为 commit_ts
+                TupleMeta meta = ReadTupleMeta(page->GetData(), off);
+                meta.begin_ts = cts;
+                WriteTupleMeta(page->GetData(), off, meta);
+                // 更新页面头
+                PageHeader header;
+                memcpy(&header, page->GetData(), PAGE_HEADER_SIZE);
+                header.num_tuples++;
+                header.free_space -= sz;
+                memcpy(page->GetData(), &header, PAGE_HEADER_SIZE);
+                bpm_.UnpinPage(pid, true);
+            }
+        } else if (rec.type == LogRecordType::DELETE) {
+            rid_t rid;
+            memcpy(&rid, rec.data.data(), 8);
+            page_id_t pid = static_cast<page_id_t>(rid >> 32);
+            int off = static_cast<int>(rid & 0xFFFFFFFF);
+
+            Page *page = bpm_.FetchPage(pid);
+            if (page) {
+                TupleMeta meta = ReadTupleMeta(page->GetData(), off);
+                meta.end_ts = cts;  // 将未提交删除变为已提交删除
+                WriteTupleMeta(page->GetData(), off, meta);
+                bpm_.UnpinPage(pid, true);
+            }
+        }
+    }
+
+    // ③ 清空 WAL（恢复完成后无需保留）
+    log_mgr_.Flush();
+    ::truncate("minidb_data.wal", 0);
 }
 
 } // namespace minidb

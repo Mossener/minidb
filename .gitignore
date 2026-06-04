@@ -2,5 +2,6 @@ build/
 .venv/
 compile_commands.json
 images/
+scripts/
 *.md
 !README.md

@@ -14,6 +14,8 @@
 #include "index/b_plus_tree.h"
 #include "transaction/transaction.h"
 #include "parser/parser.h"
+#include "storage/log_manager.h"
+#include "common/lock_manager.h"
 
 namespace minidb {
 
@@ -71,9 +73,14 @@ private:
     bool EvalCondition(const Tuple &tuple, const Schema &schema,
                        const CompareCondition &cond);
 
+    // 崩溃恢复: 启动时从 WAL 重放已提交事务的操作
+    void DoRecover();
+
     DiskManager disk_manager_;                          // 磁盘管理器
     BufferPoolManager bpm_;                             // 缓冲池管理器
     TransactionManager txn_mgr_;                        // 事务管理器
+    LogManager log_mgr_;                                // WAL 日志管理器
+    LockManager lock_mgr_;                              // 行级锁管理器
     std::unordered_map<std::string, TableInfo *> tables_; // 表注册表
 };
 
