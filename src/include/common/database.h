@@ -36,6 +36,9 @@ struct TableInfo {
 };
 
 // MiniDB: 数据库系统的顶层协调类
+// 并发控制模式: 悲观锁 (Pessimistic) 或 乐观锁 (OCC)
+enum class ConcurrencyMode { PESSIMISTIC, OPTIMISTIC };
+
 class MiniDB {
 public:
     MiniDB();
@@ -62,6 +65,9 @@ public:
     TableInfo *GetTable(const std::string &name);
     TransactionManager *GetTxnMgr() { return &txn_mgr_; }
 
+    void SetConcurrencyMode(ConcurrencyMode m) { concurrency_mode_ = m; }
+    ConcurrencyMode GetConcurrencyMode() const { return concurrency_mode_; }
+
     // 事务管理 (对外暴露的事务接口)
     Transaction *BeginTxn();
     bool CommitTxn(Transaction *txn);
@@ -82,6 +88,7 @@ private:
     TransactionManager txn_mgr_;                        // 事务管理器
     LogManager log_mgr_;                                // WAL 日志管理器
     LockManager lock_mgr_;                              // 行级锁管理器
+    ConcurrencyMode concurrency_mode_ = ConcurrencyMode::PESSIMISTIC;  // 默认悲观锁
     std::unordered_map<std::string, TableInfo *> tables_; // 表注册表
 };
 

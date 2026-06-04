@@ -2,6 +2,7 @@
 
 #include "common/database.h"
 #include <cstring>
+#include <iostream>
 #include <algorithm>
 #include <unordered_map>
 #include <unistd.h>
@@ -102,8 +103,8 @@ bool MiniDB::Delete(const std::string &table_name, int64_t key, Transaction *txn
     if (it == tables_.end()) return false;
     rid_t rid;
     if (it->second->has_index && it->second->index->GetValue(key, &rid)) {
-        // 行级锁: 先锁后删
-        if (!lock_mgr_.LockX(rid, txn->GetTxnId())) return false;
+        if (concurrency_mode_ == ConcurrencyMode::PESSIMISTIC &&
+            !lock_mgr_.LockX(rid, txn->GetTxnId())) return false;
         it->second->heap->DeleteTuple(rid, txn);
         it->second->index->Remove(key);
         // WAL: 记录 DELETE 日志
@@ -122,8 +123,8 @@ bool MiniDB::Delete(const std::string &table_name, int64_t key, Transaction *txn
             int32_t k;
             memcpy(&k, t.GetData(), sizeof(int32_t));
             if (static_cast<int64_t>(k) == key) {
-                // 行级锁
-                if (!lock_mgr_.LockX(scan_rid, txn->GetTxnId())) return false;
+                if (concurrency_mode_ == ConcurrencyMode::PESSIMISTIC &&
+                    !lock_mgr_.LockX(scan_rid, txn->GetTxnId())) return false;
                 it->second->heap->DeleteTuple(scan_rid, txn);
                 // WAL: 记录 DELETE 日志
                 const auto &wr = txn->GetWriteSet().back();
@@ -333,8 +334,8 @@ int MiniDB::ExecDelete(const SQLStatement &stmt, Transaction *txn) {
         Tuple t = tbl->heap->GetTuple(*tbl->schema, rid, txn, &txn_mgr_);
         rid_t next_rid = tbl->heap->GetNextRID(rid, *tbl->schema);
         if (!t.IsNull() && stmt.where && EvalCondition(t, *tbl->schema, *stmt.where)) {
-            // 行级锁
-            if (!lock_mgr_.LockX(rid, txn->GetTxnId())) continue;
+            if (concurrency_mode_ == ConcurrencyMode::PESSIMISTIC &&
+                !lock_mgr_.LockX(rid, txn->GetTxnId())) continue;
             tbl->heap->DeleteTuple(rid, txn);
             // WAL: 记录 DELETE 日志
             const auto &wr = txn->GetWriteSet().back();
@@ -364,7 +365,8 @@ int MiniDB::ExecUpdate(const SQLStatement &stmt, Transaction *txn) {
         Tuple t = tbl->heap->GetTuple(*tbl->schema, rid, txn, &txn_mgr_);
         rid_t next_rid = tbl->heap->GetNextRID(rid, *tbl->schema);
         if (!t.IsNull() && (!stmt.where || EvalCondition(t, *tbl->schema, *stmt.where))) {
-            if (!lock_mgr_.LockX(rid, txn->GetTxnId())) { rid = next_rid; continue; }
+            if (concurrency_mode_ == ConcurrencyMode::PESSIMISTIC &&
+                !lock_mgr_.LockX(rid, txn->GetTxnId())) { rid = next_rid; continue; }
 
             // 保存旧数据用于回滚
             page_id_t pid = static_cast<page_id_t>(rid >> 32);
@@ -454,8 +456,31 @@ bool MiniDB::CommitTxn(Transaction *txn) {
     // ① 分配提交时间戳
     txn_mgr_.Commit(txn);
     ts_t commit_ts = txn->GetCommitTs();
+    ts_t read_ts = txn->GetReadTs();
 
-    // ② WAL: 先 fsync 日志，确保 COMMIT 记录已持久化（含 commit_ts，供恢复使用）
+    // ② OCC 乐观冲突检测（仅 OPTIMISTIC 模式）
+    if (concurrency_mode_ == ConcurrencyMode::OPTIMISTIC) {
+        for (const auto &wr : txn->GetWriteSet()) {
+            if (wr.is_insert) continue;
+
+            page_id_t pid = static_cast<page_id_t>(wr.rid >> 32);
+            int off = static_cast<int>(wr.rid & 0xFFFFFFFF);
+            Page *page = bpm_.FetchPage(pid);
+            if (!page) continue;
+
+            TupleMeta meta = ReadTupleMeta(page->GetData(), off);
+            bpm_.UnpinPage(pid, false);
+
+            if (meta.txn_id == txn->GetTxnId()) continue;
+            if (meta.begin_ts > read_ts || meta.begin_ts == TS_UNCOMMITTED) {
+                txn_mgr_.Abort(txn);
+                lock_mgr_.UnlockAll(txn->GetTxnId());
+                return false;
+            }
+        }
+    }
+
+    // ③ WAL: 先 fsync 日志，确保 COMMIT 记录已持久化
     int64_t cts = commit_ts;
     log_mgr_.Append(txn->GetTxnId(), LogRecordType::COMMIT,
                     reinterpret_cast<const char*>(&cts), sizeof(int64_t));
