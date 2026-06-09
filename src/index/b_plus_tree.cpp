@@ -176,24 +176,18 @@ bool BPlusTree::Insert(int64_t key, rid_t value) {
         return true;
     }
 
-    // 步骤 3: 叶子满 — 从底向上逐级 WLock 祖先
-    // path = [root, ..., parent, leaf]，leaf 已 WLock
+    // 步骤 3: 叶子满 — WLock 祖先
+    std::vector<PageGuard> ancestors;
     for (int i = (int)path.size() - 2; i >= 0; i--) {
-        LockExclusive(path[i]);  // WLock 祖先，Unpin 由后面统一处理
+        ancestors.push_back(LockExclusive(path[i]));
     }
 
-    // 步骤 4: 分裂，InsertIntoParent 会修改已 WLock 的祖先
+    // 步骤 4: 分裂
     SplitLeaf(leaf_pid);
     leaf.release();
 
-    // 释放祖先 WLock
-    for (int i = (int)path.size() - 2; i >= 0; i--) {
-        Page *p = bpm_->FetchPage(path[i]);
-        if (p) {
-            p->GetLatch().WUnlock();
-            bpm_->UnpinPage(path[i], true);
-        }
-    }
+    // 步骤 5: 释放祖先锁（必须在递归 Insert 前释放，否则 LockShared 重入死锁）
+    ancestors.clear();
 
     return Insert(key, value);
 }
