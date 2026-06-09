@@ -126,6 +126,8 @@ void BPlusTree::SetNextPage(page_id_t page_id, page_id_t next) {
 
 // ── Insert (抄自 PG _bt_search + _bt_split 协议) ─────
 
+// ── B-link helper: follow right-links when key > last_key ──
+
 bool BPlusTree::Insert(int64_t key, rid_t value) {
     if (root_page_id_ == INVALID_PAGE_ID) {
         page_id_t pid = CreateLeafPage();
@@ -151,6 +153,17 @@ bool BPlusTree::Insert(int64_t key, rid_t value) {
         BPlusPageHeader h;
         memcpy(&h, cur.page->GetData(), sizeof(h));
         if (h.is_leaf) break;
+
+        // B-link: key > 所有键 → 沿 right-link 右移
+        if (h.num_keys > 0 && key > GetKeyAt(cur.pid, h.num_keys - 1)) {
+            page_id_t right = GetNextPage(cur.pid);
+            if (right != INVALID_PAGE_ID) {
+                cur.release();
+                cur = LockShared(right);
+                path.back() = right;
+                continue;
+            }
+        }
 
         int idx = 0;
         while (idx < h.num_keys && GetKeyAt(cur.pid, idx) <= key) idx++;
@@ -410,6 +423,9 @@ void BPlusTree::SplitInternal(page_id_t internal_id) {
     BPlusPageHeader nh{false, total - split - 1, INVALID_PAGE_ID, INVALID_PAGE_ID};
     memcpy(p2->GetData(), &nh, sizeof(nh));
     bpm_->UnpinPage(new_id, true);
+
+    // B-link: 旧 node 的 right-link 指向新 sibling
+    SetNextPage(internal_id, new_id);
 
     InsertIntoParent(internal_id, up_key, new_id);
 }
