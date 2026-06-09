@@ -616,29 +616,26 @@ void MiniDB::DoRecover() {
         }
     }
 
-    // ② 重放 INSERT / DELETE
+    // ② Redo: 重放已提交事务的 INSERT/DELETE
+    //    Undo: 撤销未提交 DELETE（恢复 old_end_ts）
     for (const auto &rec : records) {
-        int64_t cts = commit_ts_map[rec.txn_id];
-
         if (rec.type == LogRecordType::INSERT) {
-            rid_t rid;
-            int32_t sz;
+            if (!rec.committed) continue;  // 未提交 INSERT 不重放，由 MVCC 筛掉
+
+            int64_t cts = commit_ts_map[rec.txn_id];
+            rid_t rid; int32_t sz;
             memcpy(&rid, rec.data.data(), 8);
             memcpy(&sz, rec.data.data() + 8, 4);
 
             page_id_t pid = static_cast<page_id_t>(rid >> 32);
             int off = static_cast<int>(rid & 0xFFFFFFFF);
-
             Page *page = bpm_.FetchPage(pid);
             if (!page) { page = bpm_.NewPage(&pid); }
             if (page) {
-                // 写回元组数据（含未提交的 begin_ts）
                 memcpy(page->GetData() + off, rec.data.data() + 12, sz);
-                // 更新 begin_ts 为 commit_ts
                 TupleMeta meta = ReadTupleMeta(page->GetData(), off);
                 meta.begin_ts = cts;
                 WriteTupleMeta(page->GetData(), off, meta);
-                // 更新页面头
                 PageHeader header;
                 memcpy(&header, page->GetData(), PAGE_HEADER_SIZE);
                 header.num_tuples++;
@@ -649,16 +646,25 @@ void MiniDB::DoRecover() {
         } else if (rec.type == LogRecordType::DELETE) {
             rid_t rid;
             memcpy(&rid, rec.data.data(), 8);
+            int64_t old_end_ts;
+            memcpy(&old_end_ts, rec.data.data() + 8, 8);
+
             page_id_t pid = static_cast<page_id_t>(rid >> 32);
             int off = static_cast<int>(rid & 0xFFFFFFFF);
-
             Page *page = bpm_.FetchPage(pid);
-            if (page) {
-                TupleMeta meta = ReadTupleMeta(page->GetData(), off);
-                meta.end_ts = cts;  // 将未提交删除变为已提交删除
-                WriteTupleMeta(page->GetData(), off, meta);
-                bpm_.UnpinPage(pid, true);
+            if (!page) continue;
+
+            TupleMeta meta = ReadTupleMeta(page->GetData(), off);
+
+            if (rec.committed) {
+                // Redo: 已提交的删除 → end_ts = commit_ts
+                meta.end_ts = commit_ts_map[rec.txn_id];
+            } else {
+                // Undo: 未提交的删除 → 恢复 old_end_ts（撤销假删除）
+                meta.end_ts = old_end_ts;
             }
+            WriteTupleMeta(page->GetData(), off, meta);
+            bpm_.UnpinPage(pid, true);
         }
     }
 

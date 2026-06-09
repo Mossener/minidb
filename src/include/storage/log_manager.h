@@ -38,7 +38,8 @@ public:
     struct RecoveryRecord {
         int64_t txn_id;
         LogRecordType type;
-        std::vector<char> data;  // INSERT: tuple page data | DELETE: [rid][old_end_ts]
+        bool committed;      // 该事务是否已提交（true=Redo, false=需Undo）
+        std::vector<char> data;
     };
     std::vector<RecoveryRecord> Recover();
 

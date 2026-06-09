@@ -105,18 +105,18 @@ std::vector<LogManager::RecoveryRecord> LogManager::Recover() {
         pos += data_size;
     }
 
-    // 第二遍：收集已提交事务的 INSERT/DELETE
+    // 第二遍：收集所有 INSERT/DELETE（含未提交的 DELETE，供 Undo 使用）
     pos = 0;
     while (pos + HEADER_SIZE <= raw.size()) {
         auto [lsn, txn_id, type, data_size] = read_header(raw.data() + pos);
         pos += HEADER_SIZE;
         if (pos + data_size > raw.size()) break;
 
-        if ((type == LogRecordType::INSERT || type == LogRecordType::DELETE) &&
-            committed.count(txn_id)) {
+        if (type == LogRecordType::INSERT || type == LogRecordType::DELETE) {
             RecoveryRecord rec;
             rec.txn_id = txn_id;
             rec.type = type;
+            rec.committed = committed.count(txn_id) > 0;
             if (data_size > 0) {
                 rec.data.assign(raw.data() + pos, raw.data() + pos + data_size);
             }

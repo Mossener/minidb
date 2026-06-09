@@ -1,40 +1,23 @@
 #include "index/b_plus_tree.h"
 #include <cstring>
 #include <algorithm>
+#include <vector>
+#include <utility>
 
 namespace minidb {
 
-// ── Latch helpers ──────────────────────────────────
+// ── Latch helpers (RAII) ──────────────────────────
 
-BPlusTree::LatchedPage BPlusTree::RLockPage(page_id_t pid) {
+BPlusTree::PageGuard BPlusTree::LockShared(page_id_t pid) {
     Page *p = bpm_->FetchPage(pid);
     if (p) p->GetLatch().RLock();
-    return {p, pid, false};
+    return {p, pid, false, bpm_};
 }
 
-BPlusTree::LatchedPage BPlusTree::WLockPage(page_id_t pid) {
+BPlusTree::PageGuard BPlusTree::LockExclusive(page_id_t pid) {
     Page *p = bpm_->FetchPage(pid);
     if (p) p->GetLatch().WLock();
-    return {p, pid, true};
-}
-
-void BPlusTree::UnpinUnlock(LatchedPage &lp, bool dirty) {
-    if (!lp.page) return;
-    if (lp.is_write) lp.page->GetLatch().WUnlock();
-    else             lp.page->GetLatch().RUnlock();
-    bpm_->UnpinPage(lp.pid, dirty);
-}
-
-bool BPlusTree::IsSafeForInsert(LatchedPage &lp) {
-    BPlusPageHeader h;
-    memcpy(&h, lp.page->GetData(), sizeof(h));
-    return h.num_keys < MAX_KEYS - 1;  // won't split
-}
-
-bool BPlusTree::IsSafeForRemove(LatchedPage &lp) {
-    BPlusPageHeader h;
-    memcpy(&h, lp.page->GetData(), sizeof(h));
-    return h.num_keys > MIN_KEYS;  // won't merge
+    return {p, pid, true, bpm_};
 }
 
 // ── Constructor / Page creation ────────────────────
@@ -72,7 +55,7 @@ int BPlusTree::GetNumKeys(page_id_t page_id) {
     return h.num_keys;
 }
 
-// ── Key/Value/Child access (caller holds latch) ────
+// ── Key/Value/Child access ─────────────────────────
 
 int64_t BPlusTree::GetKeyAt(page_id_t page_id, int idx) {
     Page *page = bpm_->FetchPage(page_id);
@@ -117,7 +100,6 @@ void BPlusTree::SetChildAt(page_id_t page_id, int idx, page_id_t child) {
     int off = MAX_KEYS * 8 + MAX_KEYS * 8;
     Page *page = bpm_->FetchPage(page_id);
     memcpy(page->GetData() + sizeof(BPlusPageHeader) + off + idx * 4, &child, 4);
-
     BPlusPageHeader h;
     memcpy(&h, page->GetData(), sizeof(h));
     h.num_keys = std::max(h.num_keys, idx);
@@ -142,10 +124,9 @@ void BPlusTree::SetNextPage(page_id_t page_id, page_id_t next) {
     bpm_->UnpinPage(page_id, true);
 }
 
-// ── Insert (global write lock) ────────────────────
+// ── Insert (抄自 PG _bt_search + _bt_split 协议) ─────
 
 bool BPlusTree::Insert(int64_t key, rid_t value) {
-    std::lock_guard<std::recursive_mutex> lock(write_mutex_);
     if (root_page_id_ == INVALID_PAGE_ID) {
         page_id_t pid = CreateLeafPage();
         if (pid == INVALID_PAGE_ID) return false;
@@ -161,31 +142,65 @@ bool BPlusTree::Insert(int64_t key, rid_t value) {
         return true;
     }
 
-    page_id_t leaf_id = root_page_id_;
+    // 步骤 1: RLock 下降，记录路径栈
+    std::vector<page_id_t> path;
+    auto cur = LockShared(root_page_id_);
+    path.push_back(cur.pid);
+
     while (true) {
         BPlusPageHeader h;
-        Page *p = bpm_->FetchPage(leaf_id);
-        memcpy(&h, p->GetData(), sizeof(h));
-        bpm_->UnpinPage(leaf_id, false);
+        memcpy(&h, cur.page->GetData(), sizeof(h));
         if (h.is_leaf) break;
 
         int idx = 0;
-        while (idx < h.num_keys && GetKeyAt(leaf_id, idx) <= key) idx++;
-        leaf_id = GetChildAt(leaf_id, idx);
-        if (leaf_id == INVALID_PAGE_ID) return false;
+        while (idx < h.num_keys && GetKeyAt(cur.pid, idx) <= key) idx++;
+        page_id_t child_id = GetChildAt(cur.pid, idx);
+        if (child_id == INVALID_PAGE_ID) { cur.release(); return false; }
+
+        auto child = LockShared(child_id);
+        cur.release();
+        cur = std::move(child);
+        path.push_back(child_id);
+    }
+    page_id_t leaf_pid = cur.pid;
+    cur.release();
+
+    // 步骤 2: WLock leaf, 尝试乐观插入
+    auto leaf = LockExclusive(leaf_pid);
+    BPlusPageHeader lh;
+    memcpy(&lh, leaf.page->GetData(), sizeof(lh));
+
+    if (lh.num_keys < MAX_KEYS) {
+        InsertIntoLeaf(leaf_pid, key, value);
+        leaf.release();
+        return true;
     }
 
-    int nk = GetNumKeys(leaf_id);
-    if (nk >= MAX_KEYS) {
-        SplitLeaf(leaf_id);
-        return Insert(key, value);
+    // 步骤 3: 叶子满 — 从底向上逐级 WLock 祖先
+    // path = [root, ..., parent, leaf]，leaf 已 WLock
+    for (int i = (int)path.size() - 2; i >= 0; i--) {
+        LockExclusive(path[i]);  // WLock 祖先，Unpin 由后面统一处理
     }
-    InsertIntoLeaf(leaf_id, key, value);
-    return true;
+
+    // 步骤 4: 分裂，InsertIntoParent 会修改已 WLock 的祖先
+    SplitLeaf(leaf_pid);
+    leaf.release();
+
+    // 释放祖先 WLock
+    for (int i = (int)path.size() - 2; i >= 0; i--) {
+        Page *p = bpm_->FetchPage(path[i]);
+        if (p) {
+            p->GetLatch().WUnlock();
+            bpm_->UnpinPage(path[i], true);
+        }
+    }
+
+    return Insert(key, value);
 }
 
+// ── Remove ─────────────────────────────────────────
+
 bool BPlusTree::Remove(int64_t key) {
-    std::lock_guard<std::recursive_mutex> lock(write_mutex_);
     if (root_page_id_ == INVALID_PAGE_ID) return false;
 
     page_id_t leaf_id = root_page_id_;
@@ -210,34 +225,47 @@ bool BPlusTree::Remove(int64_t key) {
 bool BPlusTree::GetValue(int64_t key, rid_t *value) {
     if (root_page_id_ == INVALID_PAGE_ID) return false;
 
-    auto cur = RLockPage(root_page_id_);
-    page_id_t child_id;
+    auto cur = LockShared(root_page_id_);
 
     while (true) {
         BPlusPageHeader h;
         memcpy(&h, cur.page->GetData(), sizeof(h));
         if (h.is_leaf) break;
 
+        // 直接读 page data，不调 FetchPage（已 RLock）
+        const char *data = cur.page->GetData() + sizeof(BPlusPageHeader);
         int idx = 0;
-        while (idx < h.num_keys && GetKeyAt(cur.pid, idx) <= key) idx++;
-        child_id = GetChildAt(cur.pid, idx);
-        if (child_id == INVALID_PAGE_ID) { UnpinUnlock(cur, false); return false; }
+        int64_t k;
+        while (idx < h.num_keys) {
+            memcpy(&k, data + idx * 8, 8);
+            if (k > key) break;
+            idx++;
+        }
+        page_id_t child_id;
+        int child_off = MAX_KEYS * 8 + MAX_KEYS * 8;
+        memcpy(&child_id, data + child_off + idx * 4, 4);
+        if (child_id == INVALID_PAGE_ID) { cur.release(); return false; }
 
-        auto child = RLockPage(child_id);
-        UnpinUnlock(cur, false);  // release parent, keep child
-        cur = child;
+        auto child = LockShared(child_id);
+        cur.release();
+        cur = std::move(child);
     }
 
-    BPlusPageHeader h;
-    memcpy(&h, cur.page->GetData(), sizeof(h));
-    for (int i = 0; i < h.num_keys; i++) {
-        if (GetKeyAt(cur.pid, i) == key) {
-            *value = GetValueAt(cur.pid, i);
-            UnpinUnlock(cur, false);
+    // 在叶子上直接读 key 和 value
+    const char *leaf_data = cur.page->GetData() + sizeof(BPlusPageHeader);
+    BPlusPageHeader lh;
+    memcpy(&lh, cur.page->GetData(), sizeof(lh));
+    int val_off = MAX_KEYS * 8;
+    for (int i = 0; i < lh.num_keys; i++) {
+        int64_t k;
+        memcpy(&k, leaf_data + i * 8, 8);
+        if (k == key) {
+            memcpy(value, leaf_data + val_off + i * 8, 8);
+            cur.release();
             return true;
         }
     }
-    UnpinUnlock(cur, false);
+    cur.release();
     return false;
 }
 
@@ -247,7 +275,7 @@ std::vector<rid_t> BPlusTree::RangeScan(int64_t lower, int64_t upper) {
     std::vector<rid_t> result;
     if (root_page_id_ == INVALID_PAGE_ID) return result;
 
-    auto cur = RLockPage(root_page_id_);
+    auto cur = LockShared(root_page_id_);
     page_id_t child_id;
 
     while (true) {
@@ -258,27 +286,27 @@ std::vector<rid_t> BPlusTree::RangeScan(int64_t lower, int64_t upper) {
         int idx = 0;
         while (idx < h.num_keys && GetKeyAt(cur.pid, idx) < lower) idx++;
         child_id = GetChildAt(cur.pid, idx);
-        if (child_id == INVALID_PAGE_ID) { UnpinUnlock(cur, false); return result; }
+        if (child_id == INVALID_PAGE_ID) { cur.release(); return result; }
 
-        auto child = RLockPage(child_id);
-        UnpinUnlock(cur, false);
-        cur = child;
+        auto child = LockShared(child_id);
+        cur.release();
+        cur = std::move(child);
     }
 
     page_id_t leaf_id = cur.pid;
-    UnpinUnlock(cur, false);
+    cur.release();
 
     while (leaf_id != INVALID_PAGE_ID) {
-        auto lp = RLockPage(leaf_id);
+        auto lp = LockShared(leaf_id);
         BPlusPageHeader h;
         memcpy(&h, lp.page->GetData(), sizeof(h));
         for (int i = 0; i < h.num_keys; i++) {
             int64_t k = GetKeyAt(leaf_id, i);
-            if (k > upper) { UnpinUnlock(lp, false); return result; }
+            if (k > upper) { lp.release(); return result; }
             if (k >= lower) result.push_back(GetValueAt(leaf_id, i));
         }
         page_id_t next = GetNextPage(leaf_id);
-        UnpinUnlock(lp, false);
+        lp.release();
         leaf_id = next;
     }
     return result;
@@ -292,8 +320,7 @@ void BPlusTree::InsertIntoLeaf(page_id_t leaf_id, int64_t key, rid_t value) {
     memcpy(&h, page->GetData(), sizeof(h));
     bpm_->UnpinPage(leaf_id, false);
 
-    int nk = h.num_keys;
-    int i = 0;
+    int nk = h.num_keys, i = 0;
     while (i < nk && GetKeyAt(leaf_id, i) < key) i++;
     if (i < nk && GetKeyAt(leaf_id, i) == key) return;
 
@@ -310,8 +337,6 @@ void BPlusTree::InsertIntoLeaf(page_id_t leaf_id, int64_t key, rid_t value) {
     memcpy(p2->GetData(), &h, sizeof(h));
     bpm_->UnpinPage(leaf_id, true);
 }
-
-// ── Remove helper ──────────────────────────────────
 
 bool BPlusTree::RemoveFromLeaf(page_id_t leaf_id, int64_t key) {
     Page *page = bpm_->FetchPage(leaf_id);

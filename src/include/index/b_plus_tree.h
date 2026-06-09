@@ -6,7 +6,6 @@
 #pragma once
 
 #include <vector>
-#include <mutex>
 #include "common/config.h"
 #include "storage/page.h"
 #include "storage/buffer_pool_manager.h"
@@ -37,21 +36,46 @@ public:
     std::vector<rid_t> RangeScan(int64_t lower, int64_t upper);
 
 private:
-    // ── Latch helpers ──
-    struct LatchedPage {
+    // ── Latch helpers (RAII-style) ──
+    struct PageGuard {
         Page *page;
         page_id_t pid;
         bool is_write;
-        void RUnlock() { page->GetLatch().RUnlock(); }
-        void WUnlock() { page->GetLatch().WUnlock(); }
-    };
-    LatchedPage RLockPage(page_id_t pid);   // Fetch + RLock
-    LatchedPage WLockPage(page_id_t pid);   // Fetch + WLock
-    void UnpinUnlock(LatchedPage &lp, bool dirty);
+        BufferPoolManager *bpm;
 
-    // ── Safety checks for crabbing ──
-    bool IsSafeForInsert(LatchedPage &lp);   // num_keys < MAX_KEYS - 1
-    bool IsSafeForRemove(LatchedPage &lp);   // num_keys > MIN_KEYS
+        PageGuard() : page(nullptr), pid(-1), is_write(false), bpm(nullptr) {}
+        PageGuard(Page *p, page_id_t id, bool write, BufferPoolManager *b)
+            : page(p), pid(id), is_write(write), bpm(b) {}
+
+        // Move-only
+        PageGuard(PageGuard &&other) noexcept
+            : page(other.page), pid(other.pid), is_write(other.is_write), bpm(other.bpm) {
+            other.page = nullptr;
+        }
+        PageGuard &operator=(PageGuard &&other) noexcept {
+            if (this != &other) {
+                release();
+                page = other.page; pid = other.pid; is_write = other.is_write; bpm = other.bpm;
+                other.page = nullptr;
+            }
+            return *this;
+        }
+        PageGuard(const PageGuard &) = delete;
+        PageGuard &operator=(const PageGuard &) = delete;
+
+        ~PageGuard() { release(); }
+
+        void release() {
+            if (!page) return;
+            if (is_write) page->GetLatch().WUnlock();
+            else          page->GetLatch().RUnlock();
+            bpm->UnpinPage(pid, false);
+            page = nullptr;
+        }
+    };
+
+    PageGuard LockShared(page_id_t pid);  // Fetch + RLock
+    PageGuard LockExclusive(page_id_t pid); // Fetch + WLock
 
     // ── Page management ──
     page_id_t CreateLeafPage();
@@ -79,8 +103,8 @@ private:
 
     BufferPoolManager *bpm_;
     page_id_t root_page_id_;
-    std::recursive_mutex write_mutex_;  // 写操作全局锁（可重入，供递归 Insert）
-    // 读操作使用 per-page ReaderWriterLatch（GetValue/RangeScan）
+    // Insert: per-page WLock via path-stack (抄自 PG _bt_split 协议)
+    // Read: per-page RLock 耦合遍历
 };
 
 } // namespace minidb
