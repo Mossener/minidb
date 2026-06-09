@@ -172,6 +172,21 @@ void BenchConcurrentMixed() {
               << writers_done.load() << " writers finished\n";
 }
 
+void BenchRangeScan() {
+    DiskManager dm("bench_rs");
+    BufferPoolManager bpm(&dm);
+    BPlusTree tree(&bpm);
+    int N = 20000;
+    for (int i = 0; i < N; i++) tree.Insert(i, i);
+    
+    int K = 30;
+    auto t0 = high_resolution_clock::now();
+    for (int k = 0; k < K; k++) tree.RangeScan(9000, 10000);
+    auto t1 = high_resolution_clock::now();
+    auto us = duration_cast<microseconds>(t1 - t0).count();
+    std::cout << "Range scan ~1000 rows: " << (us/(double)K) << " us/op (" << K << "x avg)\n";
+}
+
 int main() {
     TestInsertAndScan();
     TestRangeScan();
@@ -182,5 +197,6 @@ int main() {
     BenchInsert();
     BenchPointQuery();
     BenchConcurrentReads();
+    BenchRangeScan();
     return 0;
 }
